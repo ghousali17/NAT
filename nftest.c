@@ -7,6 +7,7 @@
  */
 
 #include <stdio.h>
+#include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -31,6 +32,7 @@ typedef struct cbdata
 typedef struct nat
 {
 	unsigned int src_ip;
+	unsigned int translated_ip;
 	unsigned short src_port;
 	unsigned short nat_port;
 	struct nat *next;
@@ -44,10 +46,12 @@ typedef struct nat
 void print_ip(unsigned int ip);
 void print_nat(struct nat *nat);
 int verify_subnet(unsigned int lan_ip, unsigned int src_ip, int mask);
-struct nat *insert_nat(unsigned int src_ip, unsigned short src_port, struct nat **head);
+struct nat *insert_nat(unsigned int src_ip, unsigned short src_port, unsigned int translated_ip, struct nat **head);
 struct nat *return_nat(unsigned int src_ip, unsigned short src_port, struct nat *head);
 struct nat *return_nat(unsigned short nat_port, struct nat *head);
 void remove_nat(unsigned int nat_port, struct nat **head);
+void *receive_thread(void *args);
+pthread_mutex_t recv_lock = PTHREAD_MUTEX_INITIALIZER;
 /*
  * Callback function installed to netfilter queue
  */
@@ -106,62 +110,54 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 		{											  //determine if packet originated in subnet
 			printf("  outbound\n");
 
-			//check if nat exists //
-			//if nat doesnt exits add nat //
-			//if nat exists route to the port //
-			//modify packets //
-			//add ip src   //
-			//add tcp port  //
-			//cpmpute ip checksum  //
-			//computer tcp checksum //
 			if ((target_nat = return_nat(src_ip, src_port, *(cb_data->nat))) == NULL)
 			{
 				if (tcp_hdr->th_flags & TH_SYN) //create new connection for outbound packet only if SYN is set.
 				{
 					printf("  creating nat entry\n");
-					target_nat = insert_nat(src_ip, src_port, cb_data->nat);
-
-					print_nat(*(cb_data->nat));
+					target_nat = insert_nat(src_ip, src_port, nat, cb_data->nat);
 				}
 				else
 				{
-					printf("  unrecognized packet:dropping\n");
+					printf("  unrecognized packet:dropping\n"); //drop unmapped packets with no SYN flags.
 					return nfq_set_verdict(myQueue, id, NF_DROP, len, pktData);
 				}
 			}
 			else
 			{
-				printf("  routing to %u\n", target_nat->nat_port);
+				printf("  routing to %u\n", target_nat->nat_port); //if mapping exists forward packet after modification
 			}
 			//modify outgoing packets and computer checksums
 			ip_hdr->ip_src.s_addr = cb_data->ip; //remove 1
 			tcp_hdr->source = htons(target_nat->nat_port);
 			ip_hdr->ip_sum = ip_checksum((unsigned char *)ip_hdr); //order of checksum calculation important
 			tcp_hdr->check = tcp_checksum((unsigned char *)ip_hdr);
-			if (tcp_hdr->th_flags & TH_FIN)
+
+			if (tcp_hdr->th_flags & TH_FIN) //checks if outgoing packet has the FIN flag set
 			{
-				target_nat->internal_flag_ack = ntohl(tcp_hdr->seq) + 1;
+				target_nat->internal_flag_ack = ntohl(tcp_hdr->seq) + 1; //if FIN flag set set the expected ACK number.
 			}
-			if (target_nat->external_flag_ack != 0 && target_nat->external_flag_ack == ntohl(tcp_hdr->ack_seq))
+
+			if (target_nat->external_flag_ack != 0 && target_nat->external_flag_ack == ntohl(tcp_hdr->ack_seq)) //checks if out going packet is an ACK for FIN
 			{
-				printf("  RECIEVED ACK FOR EXTERNAL FIN:%u!\n",ntohl(tcp_hdr->ack_seq));
-		
-			  target_nat->external_fin = '1';
-			  if(target_nat->internal_fin == '1')
-				remove_nat(target_nat->nat_port,cb_data->nat);
+				printf("  received ack for externally generated fin:%u!\n", ntohl(tcp_hdr->ack_seq));
+
+				target_nat->external_fin = '1';
+				if (target_nat->internal_fin == '1')				// checks if both FINs have been acked.
+					remove_nat(target_nat->nat_port, cb_data->nat); //removed NAT entry if both FINs have been acked.
 			}
 		}
 		else
 		{
 			printf("  inbound\n");
-			if ((target_nat = return_nat(des_port, *(cb_data->nat))) == NULL)
+			if ((target_nat = return_nat(des_port, *(cb_data->nat))) == NULL) //checks if NAT mapping exists for incoming packet
 			{
-				//printf("  inbound nat entry doesnt exist\n");
+				printf("  inbound nat entry doesnt exist\n"); // drop packet if mapping doesnt exist.
 				return nfq_set_verdict(myQueue, id, NF_DROP, len, pktData);
 			}
 			else
 			{
-				printf("  Routing to host:");
+				printf("  routing to host:");
 				print_ip(target_nat->src_ip);
 				printf(" :%u\n", target_nat->src_port);
 
@@ -171,65 +167,70 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 				ip_hdr->ip_sum = ip_checksum((unsigned char *)ip_hdr); //order of checksum calculation important
 				tcp_hdr->check = tcp_checksum((unsigned char *)ip_hdr);
 
-				if (tcp_hdr->th_flags & TH_FIN)
+				if (tcp_hdr->th_flags & TH_FIN) //checks if incoming packet has the FIN flag set
 				{
-					target_nat->external_flag_ack = ntohl(tcp_hdr->seq) + 1;
+					target_nat->external_flag_ack = ntohl(tcp_hdr->seq) + 1; //set the acknowledgement number for the FIN
 				}
-				if (target_nat->internal_flag_ack !=0 && target_nat->internal_flag_ack == ntohl(tcp_hdr->ack_seq) )
+				if (target_nat->internal_flag_ack != 0 && target_nat->internal_flag_ack == ntohl(tcp_hdr->ack_seq)) //checks if the incoming packet is the ACK for a FIN
 				{
-					printf("  RECIEVED ACK FOR INTERNAL FIN:%u!\n",ntohl(tcp_hdr->ack_seq));
-				
+					printf("  received ack for internally genrated fin:%u!\n", ntohl(tcp_hdr->ack_seq));
+
 					target_nat->internal_fin = '1';
-					if(target_nat->external_fin == '1')
-						remove_nat(target_nat->nat_port,cb_data->nat);
+					if (target_nat->external_fin == '1')				//checks if ACKs for both FIN have been received.
+						remove_nat(target_nat->nat_port, cb_data->nat); //remove NAT if both FINs received.
 				}
 			}
-
-			//if nat doesnt exist drop //
-			//nat exist reroute //
-			//change dest ip //
-			//change dest port //
-			// compute tcp checksum //
-			// computer ip checksum //
 		}
-		if (tcp_hdr->th_flags & TH_RST)
+
+		if (tcp_hdr->th_flags & TH_RST) //checks if reset flag has been set.
 		{
-			target_nat = return_nat(src_ip, src_port, *(cb_data->nat));
+			target_nat = return_nat(src_ip, src_port, *(cb_data->nat)); //returns the NAT for the connection to be reset
 			if (target_nat != NULL)
 			{
-				printf("  RST FLAG SET!\n");
+				printf("  rst flag received!\n");
 				remove_nat(target_nat->nat_port, cb_data->nat);
 			}
 		}
-		
+		print_nat(*(cb_data->nat));
+		printf("\n");
+		return nfq_set_verdict(myQueue, id, NF_ACCEPT, len, pktData); // accept all TCP packets unless rejected previously.
 	}
 
-	printf("\n");
-
-	// add a newline at the end
-	printf("\n");
-
-	// For this program we'll always accept the packet...
-	print_nat(*(cb_data->nat));
-	return nfq_set_verdict(myQueue, id, NF_ACCEPT, len, pktData);
+	return nfq_set_verdict(myQueue, id, NF_DROP, len, pktData); //reject non TCP packets
 
 	// end Callback
 }
 
 void print_ip(unsigned int ip)
 {
-	printf("%u.%u.%u.%u", ip & 0xff, (ip >> 8) & 0xff,
-		   (ip >> 16) & 0xff, (ip >> 24) & 0xff);
+	char ip_address[16];
+	int len;
+	int padding;
+	int i;
+	sprintf(ip_address, "%u.%u.%u.%u", ip & 0xff, (ip >> 8) & 0xff,
+			(ip >> 16) & 0xff, (ip >> 24) & 0xff);
+	len = strlen(ip_address);
+	padding = 15 - len;
+	i;
+
+	for (i = 0; i < padding; i++)
+	{
+
+		strcat(ip_address, " ");
+	}
+	printf("%s", ip_address);
 }
 
 void print_nat(struct nat *nat)
 {
 	struct nat *temp = nat;
-	printf("  NAT:\n  ");
+	printf("\n  NAT:\n  ");
 	while (temp != NULL)
 	{
 		print_ip(temp->src_ip);
-		printf("| %u | %u | %u | %u | %c | %c |", temp->src_port, temp->nat_port, temp->internal_flag_ack, temp->external_flag_ack,temp->internal_fin,temp->external_fin);
+		printf("| %5u |", temp->src_port);
+		print_ip(temp->translated_ip);
+		printf(" | %5u | %10u | %10u | %c | %c |", temp->nat_port, temp->internal_flag_ack, temp->external_flag_ack, temp->internal_fin, temp->external_fin);
 
 		{
 			printf("\n  ");
@@ -255,16 +256,17 @@ int verify_subnet(unsigned int lan_ip, unsigned int src_ip, int mask)
 	}
 }
 
-struct nat *insert_nat(unsigned int src_ip, unsigned short src_port, struct nat **head)
+struct nat *insert_nat(unsigned int src_ip, unsigned short src_port, unsigned int translated_ip, struct nat **head)
 {
 	struct nat *new_node = (struct nat *)malloc(sizeof(nat));
 	new_node->src_ip = src_ip;
+	new_node->translated_ip = translated_ip;
 	new_node->src_port = src_port;
 	new_node->next = NULL;
 	new_node->external_flag_ack = 0;
 	new_node->internal_flag_ack = 0;
 	new_node->internal_fin = '0';
-	new_node->external_fin = '0'; 
+	new_node->external_fin = '0';
 	if (*head == NULL)
 	{
 		new_node->nat_port = 10000;
@@ -272,16 +274,28 @@ struct nat *insert_nat(unsigned int src_ip, unsigned short src_port, struct nat 
 	}
 	else
 	{
+		if ((*head)->nat_port > 10000) // if insertion at head required
+		{
+			new_node->nat_port = 10000;
+			new_node->next = *head;
+			*head = new_node;
+			return new_node;
+		}
 		struct nat *cur = *head;
 		struct nat *pre = NULL;
 		while (cur != NULL)
 		{
-
+			if (pre != NULL)
+			{
+				if ((cur->nat_port - pre->nat_port) > 1)
+					break;
+			}
 			pre = cur;
 			cur = cur->next;
 		}
 		pre->next = new_node;
 		new_node->nat_port = pre->nat_port + 1;
+		new_node->next = cur;
 	}
 	return new_node;
 }
@@ -335,8 +349,6 @@ void remove_nat(unsigned int nat_port, struct nat **head)
 		pre->next = cur->next;
 		free(cur);
 	}
-
-	printf("  clear:%u\n====================================\n", nat_port);
 }
 /*
  * Main program
