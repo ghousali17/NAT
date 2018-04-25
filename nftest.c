@@ -6,6 +6,7 @@
  * - To run it, you need to be in root
  */
 
+
 #include <stdio.h>
 #include <pthread.h>
 #include <string.h>
@@ -46,7 +47,7 @@ typedef struct nat
 struct thread_args
 {
 	nfq_q_handle *myQueue;
-	struct nfgenmsg *msg;
+
 	nfq_data *pkt;
 	struct cbdata *cbData;
 };
@@ -68,7 +69,7 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 					nfq_data *pkt, void *cbData)
 {
 
-	printf("Callback!\n");
+	//printf("Callback!\n");
 	unsigned int id = 0;
 	nfqnl_msg_packet_hdr *header;
 	if ((header = nfq_get_msg_packet_hdr(pkt)))
@@ -81,22 +82,22 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 
 	pthread_t tid;
 	struct thread_args *argument = (struct thread_args *)malloc(sizeof(struct thread_args));
-	argument->msg = msg;
+	
 	argument->myQueue = myQueue;
 	argument->pkt = pkt;
 	argument->cbData = (struct cbdata *)cbData;
     pthread_create(&tid,NULL,verdict_thread,(void*)argument);
 	pthread_join(tid,NULL);
 	//return nfq_set_verdict(myQueue, id, NF_ACCEPT, len, pktData); //reject non TCP packets
-
+   
 	// end Callback
 }
 void *verdict_thread(void *argument)
 {
-	printf("Thread called!\n");
+	//printf("Thread called!\n");
 	struct thread_args *args = (struct thread_args *)argument;
 	nfq_q_handle *myQueue = args->myQueue;
-	struct nfgenmsg *msg = args->msg;
+	//struct nfgenmsg *msg = args->msg;
 	nfq_data *pkt = args->pkt;
 	struct cbdata *cbData = args->cbData;
 
@@ -135,17 +136,17 @@ void *verdict_thread(void *argument)
 		src_port = ntohs(tcp_hdr->source);
 		des_port = ntohs(tcp_hdr->dest);
 
-		//print tcp packet details
+/*		//print tcp packet details
 		printf("  ");
 		print_ip(src_ip);
 		printf(" :%u -> ", src_port);
 		printf(" ");
 		print_ip(des_ip);
 		printf(" :%u\n", des_port);
-
+*/
 		if (verify_subnet(subnet, src_ip, mask) == 1) //compares the src_ip with subnet mask to
 		{											  //determine if packet originated in subnet
-			printf("  outbound\n");
+			//printf("  outbound\n");
 
 			if ((target_nat = return_nat(src_ip, src_port, *(cb_data->nat))) == NULL) //nat doesn't exist
 			{
@@ -156,7 +157,7 @@ void *verdict_thread(void *argument)
 					print_nat(*(cb_data->nat));
 				}
 				else
-				{
+				{   printf("invalid outbound packet fron:%u\n",src_port);
 					//drop unmapped packets with no SYN flags.
 					nfq_set_verdict(myQueue, id, NF_DROP, len, pktData);
 					pthread_exit(NULL);
@@ -164,7 +165,7 @@ void *verdict_thread(void *argument)
 			}
 			else
 			{
-				printf("  routing to %u\n", target_nat->nat_port); //if mapping exists forward packet after modification
+				//printf("  routing to %u\n", target_nat->nat_port); //if mapping exists forward packet after modification
 			}
 
 			//modify outgoing packets and computer checksums
@@ -180,7 +181,7 @@ void *verdict_thread(void *argument)
 
 			if (target_nat->external_flag_ack != 0 && target_nat->external_flag_ack == ntohl(tcp_hdr->ack_seq)) //checks if out going packet is an ACK for FIN
 			{
-				printf("  received ack for externally generated fin:%u!\n", ntohl(tcp_hdr->ack_seq));
+				//printf("  received ack for externally generated fin:%u!\n", ntohl(tcp_hdr->ack_seq));
 
 				target_nat->external_fin = '1';
 				if (target_nat->internal_fin == '1') // checks if both FINs have been acked.
@@ -192,7 +193,7 @@ void *verdict_thread(void *argument)
 		}
 		else
 		{
-			printf("  inbound\n");
+			//printf("  inbound\n");
 			if ((target_nat = return_nat(des_port, *(cb_data->nat))) == NULL) //checks if NAT mapping exists for incoming packet
 			{
 				printf("  inbound nat entry doesnt exist\n"); // drop packet if mapping doesnt exist.
@@ -217,7 +218,7 @@ void *verdict_thread(void *argument)
 				}
 				if (target_nat->internal_flag_ack != 0 && target_nat->internal_flag_ack == ntohl(tcp_hdr->ack_seq)) //checks if the incoming packet is the ACK for a FIN
 				{
-					printf("  received ack for internally genrated fin:%u!\n", ntohl(tcp_hdr->ack_seq));
+			//		printf("  received ack for internally genrated fin:%u!\n", ntohl(tcp_hdr->ack_seq));
 
 					target_nat->internal_fin = '1';
 					if (target_nat->external_fin == '1') //checks if ACKs for both FIN have been received.
@@ -271,20 +272,26 @@ void print_ip(unsigned int ip)
 void print_nat(struct nat *nat)
 {
 	struct nat *temp = nat;
-	printf("\n  NAT:\n  ");
+	printf("\nNAT:\n");
+	printf("-----------------------------------------------------------\n");
+	printf("|     LAN IP     | LAN PORT  |     NAT IP     | NAT PORT  |\n");
+	printf("-----------------------------------------------------------\n");
+    
 	while (temp != NULL)
-	{
+	{   printf("| ");
 		print_ip(temp->src_ip);
-		printf("| %5u |", temp->src_port);
+		printf("|   %05u   |", temp->src_port);
+		printf(" ");
 		print_ip(temp->translated_ip);
-		printf(" | %5u | %10u | %10u | %c | %c |", temp->nat_port, temp->internal_flag_ack, temp->external_flag_ack, temp->internal_fin, temp->external_fin);
-
+		printf("|   %05u   | %10u | %10u | %c | %c |", temp->nat_port, temp->internal_flag_ack, temp->external_flag_ack, temp->internal_fin, temp->external_fin);
+         //remove debug info at the end
 		{
-			printf("\n  ");
+			printf("\n");
 		}
 		temp = temp->next;
 	}
-	printf("\n");
+	printf("-----------------------------------------------------------\n");
+	
 }
 // determine if the packet is outbound or inbound
 int verify_subnet(unsigned int lan_ip, unsigned int src_ip, int mask)
@@ -465,7 +472,9 @@ int main(int argc, char **argv)
 		// I am not totally sure why a callback mechanism is used
 		// rather than just handling it directly here, but that
 		// seems to be the convention...
+		//printf("Res:%d\n",res);
 		nfq_handle_packet(nfqHandle, buf, res);
+
 		// end while receiving traffic
 	}
 
