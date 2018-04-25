@@ -43,6 +43,14 @@ typedef struct nat
 	// even if fin initiate by internal and odd if initiated by external
 } nat;
 
+struct thread_args
+{
+	nfq_q_handle *myQueue;
+	struct nfgenmsg *msg;
+	nfq_data *pkt;
+	struct cbdata *cbData;
+};
+
 void print_ip(unsigned int ip);
 void print_nat(struct nat *nat);
 int verify_subnet(unsigned int lan_ip, unsigned int src_ip, int mask);
@@ -51,6 +59,7 @@ struct nat *return_nat(unsigned int src_ip, unsigned short src_port, struct nat 
 struct nat *return_nat(unsigned short nat_port, struct nat *head);
 void remove_nat(unsigned int nat_port, struct nat **head);
 void *receive_thread(void *args);
+void *verdict_thread(void *argument);
 pthread_mutex_t recv_lock = PTHREAD_MUTEX_INITIALIZER;
 /*
  * Callback function installed to netfilter queue
@@ -58,6 +67,39 @@ pthread_mutex_t recv_lock = PTHREAD_MUTEX_INITIALIZER;
 static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 					nfq_data *pkt, void *cbData)
 {
+
+	printf("Callback!\n");
+	unsigned int id = 0;
+	nfqnl_msg_packet_hdr *header;
+	if ((header = nfq_get_msg_packet_hdr(pkt)))
+	{
+		id = ntohl(header->packet_id);
+		//printf("  id: %u\n", id);
+	}
+	unsigned char *pktData;
+	int len = nfq_get_payload(pkt, (unsigned char **)&pktData);
+
+	pthread_t tid;
+	struct thread_args *argument = (struct thread_args *)malloc(sizeof(struct thread_args));
+	argument->msg = msg;
+	argument->myQueue = myQueue;
+	argument->pkt = pkt;
+	argument->cbData = (struct cbdata *)cbData;
+    pthread_create(&tid,NULL,verdict_thread,(void*)argument);
+	pthread_join(tid,NULL);
+	//return nfq_set_verdict(myQueue, id, NF_ACCEPT, len, pktData); //reject non TCP packets
+
+	// end Callback
+}
+void *verdict_thread(void *argument)
+{
+	printf("Thread called!\n");
+	struct thread_args *args = (struct thread_args *)argument;
+	nfq_q_handle *myQueue = args->myQueue;
+	struct nfgenmsg *msg = args->msg;
+	nfq_data *pkt = args->pkt;
+	struct cbdata *cbData = args->cbData;
+
 	unsigned int id = 0;
 	nfqnl_msg_packet_hdr *header;
 	struct ip *ip_hdr;
@@ -79,11 +121,6 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 		//printf("  id: %u\n", id);
 	}
 
-	// print the timestamp (PC: seems the timestamp is not always set)
-
-	// Print the payload; in copy meta mode, only headers will be
-	// included; in copy packet mode, whole packet will be returned.
-	//printf(" payload: ");
 	unsigned char *pktData;
 	int len = nfq_get_payload(pkt, (unsigned char **)&pktData);
 	ip_hdr = (struct ip *)pktData;
@@ -92,7 +129,7 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 	{
 		tcp_hdr = (struct tcphdr *)((unsigned char *)ip_hdr + (ip_hdr->ip_hl << 2));
 
-		//disect packet heafer for printable iformation
+		//disect packet header for printable iformation
 		src_ip = ip_hdr->ip_src.s_addr;
 		des_ip = ip_hdr->ip_dst.s_addr;
 		src_port = ntohs(tcp_hdr->source);
@@ -110,23 +147,26 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 		{											  //determine if packet originated in subnet
 			printf("  outbound\n");
 
-			if ((target_nat = return_nat(src_ip, src_port, *(cb_data->nat))) == NULL)
+			if ((target_nat = return_nat(src_ip, src_port, *(cb_data->nat))) == NULL) //nat doesn't exist
 			{
 				if (tcp_hdr->th_flags & TH_SYN) //create new connection for outbound packet only if SYN is set.
 				{
-					printf("  creating nat entry\n");
+
 					target_nat = insert_nat(src_ip, src_port, nat, cb_data->nat);
+					print_nat(*(cb_data->nat));
 				}
 				else
 				{
-					printf("  unrecognized packet:dropping\n"); //drop unmapped packets with no SYN flags.
-					return nfq_set_verdict(myQueue, id, NF_DROP, len, pktData);
+					//drop unmapped packets with no SYN flags.
+					nfq_set_verdict(myQueue, id, NF_DROP, len, pktData);
+					pthread_exit(NULL);
 				}
 			}
 			else
 			{
 				printf("  routing to %u\n", target_nat->nat_port); //if mapping exists forward packet after modification
 			}
+
 			//modify outgoing packets and computer checksums
 			ip_hdr->ip_src.s_addr = cb_data->ip; //remove 1
 			tcp_hdr->source = htons(target_nat->nat_port);
@@ -143,8 +183,11 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 				printf("  received ack for externally generated fin:%u!\n", ntohl(tcp_hdr->ack_seq));
 
 				target_nat->external_fin = '1';
-				if (target_nat->internal_fin == '1')				// checks if both FINs have been acked.
-					remove_nat(target_nat->nat_port, cb_data->nat); //removed NAT entry if both FINs have been acked.
+				if (target_nat->internal_fin == '1') // checks if both FINs have been acked.
+				{
+					remove_nat(target_nat->nat_port, cb_data->nat);
+					print_nat(*(cb_data->nat));
+				} //removed NAT entry if both FINs have been acked.
 			}
 		}
 		else
@@ -153,7 +196,8 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 			if ((target_nat = return_nat(des_port, *(cb_data->nat))) == NULL) //checks if NAT mapping exists for incoming packet
 			{
 				printf("  inbound nat entry doesnt exist\n"); // drop packet if mapping doesnt exist.
-				return nfq_set_verdict(myQueue, id, NF_DROP, len, pktData);
+				nfq_set_verdict(myQueue, id, NF_DROP, len, pktData);
+				pthread_exit(NULL);
 			}
 			else
 			{
@@ -176,8 +220,11 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 					printf("  received ack for internally genrated fin:%u!\n", ntohl(tcp_hdr->ack_seq));
 
 					target_nat->internal_fin = '1';
-					if (target_nat->external_fin == '1')				//checks if ACKs for both FIN have been received.
-						remove_nat(target_nat->nat_port, cb_data->nat); //remove NAT if both FINs received.
+					if (target_nat->external_fin == '1') //checks if ACKs for both FIN have been received.
+					{
+						remove_nat(target_nat->nat_port, cb_data->nat);
+						print_nat(*(cb_data->nat));
+					} //remove NAT if both FINs received.
 				}
 			}
 		}
@@ -189,18 +236,18 @@ static int Callback(nfq_q_handle *myQueue, struct nfgenmsg *msg,
 			{
 				printf("  rst flag received!\n");
 				remove_nat(target_nat->nat_port, cb_data->nat);
+				print_nat(*(cb_data->nat));
 			}
 		}
-		print_nat(*(cb_data->nat));
+
 		printf("\n");
-		return nfq_set_verdict(myQueue, id, NF_ACCEPT, len, pktData); // accept all TCP packets unless rejected previously.
+		nfq_set_verdict(myQueue, id, NF_ACCEPT, len, pktData); // accept all TCP packets unless rejected previously.
+		pthread_exit(NULL);
 	}
 
-	return nfq_set_verdict(myQueue, id, NF_DROP, len, pktData); //reject non TCP packets
-
-	// end Callback
+	nfq_set_verdict(myQueue, id, NF_DROP, len, pktData); //reject non TCP packets
+	pthread_exit(NULL);
 }
-
 void print_ip(unsigned int ip)
 {
 	char ip_address[16];
@@ -357,16 +404,22 @@ int main(int argc, char **argv)
 {
 	struct nfq_handle *nfqHandle;
 	struct cbdata cb_data;
-	cb_data.ip = inet_addr(argv[1]);
-	cb_data.subnet = inet_addr(argv[2]);
-	cb_data.mask = (unsigned int)atoi(argv[3]);
-	cb_data.nat = (struct nat **)malloc(sizeof(struct nat *));
-	*(cb_data.nat) = NULL;
 	struct nfq_q_handle *myQueue;
 	struct nfnl_handle *netlinkHandle;
 
 	int fd, res;
 	char buf[4096];
+	if (argc != 6)
+	{
+
+		fprintf(stderr, "Usage: ./NAT <IP> <LAN> <Mask> <bucket size> <fill rate>\n");
+		exit(-1);
+	}
+	cb_data.ip = inet_addr(argv[1]);
+	cb_data.subnet = inet_addr(argv[2]);
+	cb_data.mask = (unsigned int)atoi(argv[3]);
+	cb_data.nat = (struct nat **)malloc(sizeof(struct nat *));
+	*(cb_data.nat) = NULL;
 
 	// Get a queue connection handle from the module
 	if (!(nfqHandle = nfq_open()))
