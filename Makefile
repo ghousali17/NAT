@@ -1,6 +1,9 @@
+CC = g++
+CFLAGS = -Wall
+LIB = -lnfnetlink -lnetfilter_queue -lpthread
+
 all:
-	g++ -o nftest nftest.c checksum.c -lnfnetlink -lnetfilter_queue -lpthread
-checksum:
-	g++ checksum.o checksum.c
+	$(CC) $(CFLAGS) nat.c checksum.c -o nat $(LIB)
+
 clean:
-	@rm -f nftest
+	@rm -f nat
