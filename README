@@ -6,8 +6,10 @@
 
 The script for iptables configuration provided in the assignment specification
 >> Please modify the VM Group ID for the variable "VMID" before running. <<
+>> Please ensure internal VMs or devices are connected to the  NAT machine and forwarding their packets to it. 
 
-2, checksum.h
+
+2,. checksum.h
 
 Header file to include for using "checksum.c"
 
